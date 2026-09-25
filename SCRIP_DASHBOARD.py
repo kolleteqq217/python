@@ -1,304 +1,296 @@
+import io
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.express as px
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# Configuración visual de la página en Streamlit
+# --- Configuración visual ---
 st.set_page_config(
-    page_title="Tablero de Control de Cartera y Cobranzas",
-    page_icon="💼",
+    page_title="Dashboard Comercial | GlobalTech",
+    page_icon="📊",
     layout="wide"
 )
 
-# ------------------------------------------------------------------------------
-# 1. CARGA Y PREPARACIÓN DE DATOS CON CACHÉ
-# ------------------------------------------------------------------------------
-@st.cache_data
-def cargar_datos():
+# --- Función de limpieza numérica ---
+def clean_val(v):
+    if pd.isna(v) or v is None:
+        return 0.0
+    s = str(v).strip().replace('$', '').replace(' ', '').replace('\xa0', '')
+    if not s or s.lower() in ('nan', 'none', 'null'):
+        return 0.0
+    if '.' in s and ',' in s:
+        if s.rfind('.') > s.rfind(','):
+            s = s.replace(',', '')
+        else:
+            s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        parts = s.split(',')
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            s = s.replace(',', '.')
+        else:
+            s = s.replace(',', '')
     try:
-        df = pd.read_excel('Dataset_Integrado_Final_Sesion4.xlsx', sheet_name='Consolidado_Multiarea')
+        return float(s)
+    except Exception:
+        return 0.0
+
+# --- 1. Autenticación con Google Drive ---
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+@st.cache_resource
+def get_drive_service():
+    """Inicializa el cliente de Google Drive."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return build('drive', 'v3', credentials=creds)
+
+# --- 2. Descargar datos desde Google Drive ---
+@st.cache_data(ttl=60)
+def load_data_from_drive(file_id):
+    """Descarga el Excel en memoria."""
+    service = get_drive_service()
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    
+    # Cargar pestaña 'Ventas'
+    try:
+        df = pd.read_excel(fh, sheet_name="Ventas", engine='openpyxl')
+    except Exception:
+        fh.seek(0)
+        df = pd.read_excel(fh, sheet_name=0, engine='openpyxl')
         
-        # Limpiar espacios invisibles al inicio y final de los encabezados
-        df.columns = df.columns.astype(str).str.strip()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    
+    if 'fecha' in df.columns:
+        df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce').dt.strftime('%Y-%m-%d')
         
-        # Formato de fecha
-        if 'Fecha_Operacion' in df.columns:
-            df['Fecha_Operacion'] = pd.to_datetime(df['Fecha_Operacion'], errors='coerce')
-        
-        # Cálculo de Monto Cobrado según el estado
-        if 'Monto_Neto_Cobrado_USD' not in df.columns:
-            if 'Estado_Cobranza' in df.columns and 'Monto_Facturado_USD' in df.columns:
-                df['Monto_Neto_Cobrado_USD'] = np.where(
-                    df['Estado_Cobranza'] == 'Cobrado / Al Día',
-                    df['Monto_Facturado_USD'],
-                    0.0
-                )
-            else:
-                df['Monto_Neto_Cobrado_USD'] = 0.0
-
-        # Homologación del Margen Operativo / Neto
-        if 'Margen_Operativo_USD' not in df.columns:
-            if 'Margen_Neto_USD' in df.columns:
-                df['Margen_Operativo_USD'] = df['Margen_Neto_USD']
-            elif 'Monto_Facturado_USD' in df.columns and 'Costo_Transaccional_USD' in df.columns:
-                df['Margen_Operativo_USD'] = df['Monto_Facturado_USD'] - df['Costo_Transaccional_USD']
-            else:
-                df['Margen_Operativo_USD'] = 0.0
-
-        return df
-
-    except Exception as e:
-        st.error(f"❌ Error al cargar el archivo Excel: {e}")
-        return pd.DataFrame()
-
-df = cargar_datos()
-
-if df.empty:
-    st.warning("No se pudo cargar la información. Verifica que el archivo 'Dataset_Integrado_Final_Sesion4.xlsx' esté en la raíz del repositorio.")
-    st.stop()
-
-# ------------------------------------------------------------------------------
-# 2. FILTROS GLOBALES (BARRA LATERAL)
-# ------------------------------------------------------------------------------
-st.sidebar.header("🎯 Filtros Globales")
-
-def obtener_valores_unicos(col):
-    if col in df.columns:
-        return ['Todos'] + sorted(df[col].dropna().unique().tolist())
-    return ['Todos']
-
-paises = obtener_valores_unicos('Pais_Sede')
-canales = obtener_valores_unicos('Canal')
-tiers = obtener_valores_unicos('Tier_Estrategico')
-estados = obtener_valores_unicos('Estado_Cobranza')
-
-filtro_pais = st.sidebar.selectbox('País Sede:', paises)
-filtro_canal = st.sidebar.selectbox('Canal de Venta:', canales)
-filtro_tier = st.sidebar.selectbox('Tier Estratégico:', tiers)
-filtro_estado = st.sidebar.selectbox('Estado de Cobranza:', estados)
-
-# Filtrado reactivo de datos
-dff = df.copy()
-if filtro_pais != 'Todos' and 'Pais_Sede' in dff.columns:
-    dff = dff[dff['Pais_Sede'] == filtro_pais]
-if filtro_canal != 'Todos' and 'Canal' in dff.columns:
-    dff = dff[dff['Canal'] == filtro_canal]
-if filtro_tier != 'Todos' and 'Tier_Estrategico' in dff.columns:
-    dff = dff[dff['Tier_Estrategico'] == filtro_tier]
-if filtro_estado != 'Todos' and 'Estado_Cobranza' in dff.columns:
-    dff = dff[dff['Estado_Cobranza'] == filtro_estado]
-
-st.title("💼 Tablero de Control de Cartera y Cobranzas")
-
-if dff.empty:
-    st.warning("⚠️ No hay transacciones que cumplan con la combinación de filtros seleccionada.")
-    st.stop()
-
-# ------------------------------------------------------------------------------
-# 3. TARJETAS DE MÉTRICAS (KPIS)
-# ------------------------------------------------------------------------------
-total_fact = dff['Monto_Facturado_USD'].sum() if 'Monto_Facturado_USD' in dff.columns else 0.0
-total_cobr = dff['Monto_Neto_Cobrado_USD'].sum() if 'Monto_Neto_Cobrado_USD' in dff.columns else 0.0
-
-if 'Estado_Cobranza' in dff.columns and 'Monto_Facturado_USD' in dff.columns:
-    total_mora = dff[dff['Estado_Cobranza'] != 'Cobrado / Al Día']['Monto_Facturado_USD'].sum()
-else:
-    total_mora = 0.0
-
-margen_neto = dff['Margen_Operativo_USD'].sum() if 'Margen_Operativo_USD' in dff.columns else 0.0
-
-pct_mora = (total_mora / total_fact * 100) if total_fact > 0 else 0
-pct_cobrado = (total_cobr / total_fact * 100) if total_fact > 0 else 0
-margen_pct = (margen_neto / total_fact * 100) if total_fact > 0 else 0
-
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-
-with kpi1:
-    st.metric(
-        label="Facturación Total",
-        value=f"${total_fact:,.2f}",
-        delta=f"{len(dff)} transacciones",
-        delta_color="off"
-    )
-
-with kpi2:
-    st.metric(
-        label="Cobrado Efectivo",
-        value=f"${total_cobr:,.2f}",
-        delta=f"{pct_cobrado:.1f}% efectividad"
-    )
-
-with kpi3:
-    st.metric(
-        label="Cartera en Mora",
-        value=f"${total_mora:,.2f}",
-        delta=f"{pct_mora:.1f}% en riesgo",
-        delta_color="inverse"
-    )
-
-with kpi4:
-    st.metric(
-        label="Margen Operativo",
-        value=f"{margen_pct:.1f}%",
-        delta=f"${margen_neto:,.2f} neto"
-    )
-
-st.markdown("---")
-
-# ------------------------------------------------------------------------------
-# 4. GRÁFICOS DINÁMICOS E INTERACTIVOS (PLOTLY)
-# ------------------------------------------------------------------------------
-st.subheader("📈 Diagnóstico Visual del Portafolio")
-
-g_fila1_col1, g_fila1_col2 = st.columns(2)
-g_fila2_col1, g_fila2_col2 = st.columns(2)
-
-colores_cob = {
-    'Cobrado / Al Día': '#10B981',
-    'Mora Leve (<30d)': '#F59E0B',
-    'Mora Crítica (>30d)': '#EF4444'
-}
-
-# --- Gráfico 1: Barras Apiladas por Sector y Cobranza ---
-with g_fila1_col1:
-    if 'Sector_Industria' in dff.columns and 'Estado_Cobranza' in dff.columns:
-        df_sec = dff.groupby(['Sector_Industria', 'Estado_Cobranza'], as_index=False)['Monto_Facturado_USD'].sum()
-        
-        fig1 = px.bar(
-            df_sec,
-            x='Sector_Industria',
-            y='Monto_Facturado_USD',
-            color='Estado_Cobranza',
-            color_discrete_map=colores_cob,
-            title='<b>1. Facturación por Sector Industrial y Cobro</b>',
-            labels={'Monto_Facturado_USD': 'Monto Facturado ($)', 'Sector_Industria': 'Sector', 'Estado_Cobranza': 'Cobranza'}
-        )
-        fig1.update_layout(
-            barmode='stack',
-            xaxis_tickangle=-25,
-            template='plotly_white',
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=20, r=20, t=50, b=40)
-        )
-        fig1.update_traces(
-            hovertemplate="<b>%{x}</b><br>Estado: %{fullData.name}<br>Facturado: <b>$%{y:,.2f}</b><extra></extra>"
-        )
-        st.plotly_chart(fig1, use_container_width=True)
-
-# --- Gráfico 2: Dona Interactiva por Tier ---
-with g_fila1_col2:
-    if 'Tier_Estrategico' in dff.columns:
-        df_tier = dff.groupby('Tier_Estrategico', as_index=False)['Monto_Facturado_USD'].sum()
-        
-        fig2 = px.pie(
-            df_tier,
-            names='Tier_Estrategico',
-            values='Monto_Facturado_USD',
-            hole=0.48,
-            title='<b>2. Participación por Tier de Cliente</b>',
-            color_discrete_sequence=['#1E3A8A', '#0D9488', '#F59E0B', '#6366F1']
-        )
-        fig2.update_layout(
-            template='plotly_white',
-            margin=dict(l=20, r=20, t=50, b=20)
-        )
-        fig2.update_traces(
-            textinfo='percent+label',
-            hovertemplate="<b>%{label}</b><br>Facturación: <b>$%{value:,.2f}</b><br>Participación: <b>%{percent}</b><extra></extra>"
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-# --- Gráfico 3: Boxplot Interactivo de Días de Mora ---
-with g_fila2_col1:
-    if 'Sector_Industria' in dff.columns and 'Dias_Mora' in dff.columns:
-        fig3 = px.box(
-            dff,
-            x='Sector_Industria',
-            y='Dias_Mora',
-            points="outliers",
-            color_discrete_sequence=['#3B82F6'],
-            title='<b>3. Auditoría de Mora por Sector</b>',
-            labels={'Dias_Mora': 'Días de Mora', 'Sector_Industria': 'Sector'}
-        )
-        fig3.update_layout(
-            xaxis_tickangle=-25,
-            template='plotly_white',
-            margin=dict(l=20, r=20, t=50, b=40)
-        )
-        fig3.update_traces(
-            hovertemplate="Sector: <b>%{x}</b><br>Días de Mora: <b>%{y} días</b><extra></extra>"
-        )
-        st.plotly_chart(fig3, use_container_width=True)
-
-# --- Gráfico 4: Barras Horizontales por KAM ---
-with g_fila2_col2:
-    if 'Ejecutivo_KAM' in dff.columns:
-        df_kam = dff.groupby('Ejecutivo_KAM', as_index=False)['Monto_Facturado_USD'].sum()
-        df_kam['Monto_kUSD'] = df_kam['Monto_Facturado_USD'] / 1000
-        df_kam = df_kam.sort_values(by='Monto_kUSD', ascending=True)
-
-        fig4 = px.bar(
-            df_kam,
-            x='Monto_kUSD',
-            y='Ejecutivo_KAM',
-            orientation='h',
-            color_discrete_sequence=['#0D9488'],
-            title='<b>4. Cartera Total por KAM ($k USD)</b>',
-            labels={'Monto_kUSD': 'Miles de USD ($k)', 'Ejecutivo_KAM': 'Ejecutivo KAM'}
-        )
-        fig4.update_layout(
-            template='plotly_white',
-            margin=dict(l=20, r=20, t=50, b=40)
-        )
-        fig4.update_traces(
-            hovertemplate="KAM: <b>%{y}</b><br>Cartera: <b>$%{x:,.1f}k USD</b><extra></extra>"
-        )
-        st.plotly_chart(fig4, use_container_width=True)
-
-st.markdown("---")
-
-# ------------------------------------------------------------------------------
-# 5. CONSTRUCTOR DINÁMICO DE TABLA DINÁMICA (PIVOT TABLE)
-# ------------------------------------------------------------------------------
-st.subheader("📊 Constructor Dinámico de Matriz")
-
-posibles_filas = [c for c in ['Sector_Industria', 'Pais_Sede', 'Ejecutivo_KAM', 'Canal', 'Metodo_Pago', 'Tier_Estrategico'] if c in dff.columns]
-posibles_columnas = [c for c in ['Estado_Cobranza', 'Tier_Estrategico', 'Canal', 'Pais_Sede'] if c in dff.columns]
-
-mapa_metricas = {
-    'Suma Facturación ($ USD)': ('Monto_Facturado_USD', 'sum', '${:,.2f}'),
-    'Suma Margen Neto ($ USD)': ('Margen_Operativo_USD', 'sum', '${:,.2f}'),
-    'Promedio Días de Mora': ('Dias_Mora', 'mean', '{:.1f} días'),
-    'Conteo de Transacciones': ('ID_Transaccion', 'count', '{:,.0f}')
-}
-
-p_col1, p_col2, p_col3 = st.columns(3)
-
-with p_col1:
-    p_fila = st.selectbox('Variable en Filas:', posibles_filas, index=0 if posibles_filas else None)
-
-with p_col2:
-    idx_col = 1 if len(posibles_columnas) > 1 else 0
-    p_col = st.selectbox('Variable en Columnas:', posibles_columnas, index=idx_col if posibles_columnas else None)
-
-with p_col3:
-    p_metrica = st.selectbox('Métrica a Calcular:', list(mapa_metricas.keys()), index=0)
-
-if p_fila and p_col:
-    if p_fila == p_col:
-        st.warning("⚠️ Selecciona variables distintas para filas y columnas.")
+    if 'cantidad' in df.columns:
+        df['cantidad'] = df['cantidad'].apply(clean_val).astype(int)
     else:
-        col_valor, funcion_agg, formato_num = mapa_metricas[p_metrica]
+        df['cantidad'] = 0
+        
+    if 'precio_unitario' in df.columns:
+        df['precio_unitario'] = df['precio_unitario'].apply(clean_val)
+    else:
+        df['precio_unitario'] = 0.0
+        
+    if 'total_venta' in df.columns:
+        df['total_venta'] = df['total_venta'].apply(clean_val)
+    else:
+        df['total_venta'] = 0.0
+        
+    # Recalcular si vino vacío por ser fórmula
+    mask = (df['total_venta'] == 0)
+    df.loc[mask, 'total_venta'] = df.loc[mask, 'cantidad'] * df.loc[mask, 'precio_unitario']
+    
+    return df
 
-        tabla_pivot = pd.pivot_table(
-            dff,
-            index=p_fila,
-            columns=p_col,
-            values=col_valor,
-            aggfunc=funcion_agg,
-            fill_value=0,
-            margins=True,
-            margins_name='Total General'
-        )
+# --- 3. Subir y guardar datos preservando diseño, pestañas y fórmulas ---
+def save_data_to_drive(file_id, df_to_save):
+    """Actualiza el Excel conservando formato, estilos, anchos de columna y fórmulas."""
+    service = get_drive_service()
+    
+    # Descargar el libro actual para no perder hojas adicionales (como Dashboard_Resumen)
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    
+    try:
+        wb = openpyxl.load_workbook(fh)
+    except Exception:
+        wb = openpyxl.Workbook()
 
-        st.dataframe(tabla_pivot.style.format(formato_num), use_container_width=True)
+    # Seleccionar o crear la hoja Ventas
+    if "Ventas" in wb.sheetnames:
+        ws = wb["Ventas"]
+        ws.delete_rows(1, ws.max_row + 10)  # Limpiar contenido anterior
+    else:
+        ws = wb.active
+        ws.title = "Ventas"
+
+    # Encabezados
+    cols = ["id_transaccion", "fecha", "cliente", "ciudad", "categoria", "producto", "cantidad", "precio_unitario", "total_venta", "estado"]
+    ws.append(cols)
+
+    # Estilos del encabezado (Azul oscuro corporativo + texto blanco negrita)
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+
+    for col_idx in range(1, len(cols) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+
+    # Bordes sutiles para las filas
+    thin_border = Border(
+        left=Side(style='thin', color='E0E0E0'),
+        right=Side(style='thin', color='E0E0E0'),
+        top=Side(style='thin', color='E0E0E0'),
+        bottom=Side(style='thin', color='E0E0E0')
+    )
+
+    # Insertar filas con fórmulas y formatos
+    for row_idx, (_, row) in enumerate(df_to_save.iterrows(), start=2):
+        cant = int(clean_val(row.get('cantidad', 0)))
+        precio = float(clean_val(row.get('precio_unitario', 0.0)))
+        formula_total = f"=G{row_idx}*H{row_idx}"  # Columna G (cantidad) * Columna H (precio)
+        
+        row_values = [
+            str(row.get('id_transaccion', f"TRX-{row_idx-1:04d}")),
+            str(row.get('fecha', '')),
+            str(row.get('cliente', '')),
+            str(row.get('ciudad', '')),
+            str(row.get('categoria', '')),
+            str(row.get('producto', '')),
+            cant,
+            precio,
+            formula_total,
+            str(row.get('estado', 'Completado'))
+        ]
+        ws.append(row_values)
+
+        # Formato numérico y de moneda
+        ws.cell(row=row_idx, column=7).number_format = '#,##0'
+        ws.cell(row=row_idx, column=8).number_format = '$#,##0.00'
+        ws.cell(row=row_idx, column=9).number_format = '$#,##0.00'
+
+        for c_i in range(1, len(cols) + 1):
+            c_cell = ws.cell(row=row_idx, column=c_i)
+            c_cell.border = thin_border
+            if c_i in (1, 2, 10):
+                c_cell.alignment = Alignment(horizontal="center")
+
+    # Ajuste automático del ancho de columnas para que no se encima nada
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = max(len(str(c.value or '')) for c in col)
+        ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+    # Guardar en buffer y subir a Google Drive
+    out_buf = io.BytesIO()
+    wb.save(out_buf)
+    out_buf.seek(0)
+
+    media = MediaIoBaseUpload(
+        out_buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        resumable=True
+    )
+    service.files().update(
+        fileId=file_id,
+        media_body=media,
+        supportsAllDrives=True
+    ).execute()
+
+# --- 4. Encabezado de la App ---
+col_title, col_btn = st.columns([5, 1])
+with col_title:
+    st.title("📈 Panel de Ventas en Vivo")
+    st.caption("Conectado bidireccionalmente a Google Drive (base_datos_ventas.xlsx)")
+
+with col_btn:
+    st.write("")
+    if st.button("🔄 Refrescar", help="Descarga los datos más recientes de Drive"):
+        st.cache_data.clear()
+        st.rerun()
+
+FILE_ID = st.secrets["drive_settings"]["file_id"]
+
+try:
+    with st.spinner("Cargando datos desde Google Drive..."):
+        df = load_data_from_drive(FILE_ID)
+except Exception as e:
+    st.error(f"Error al conectar con Google Drive: {e}")
+    st.stop()
+
+# --- 5. Pestañas: Dashboard Visual vs Editor Interactivo ---
+tab_dash, tab_edit = st.tabs(["📊 Dashboard y Reportes", "✏️ Editor de Base de Datos"])
+
+with tab_dash:
+    st.sidebar.header("🔍 Filtros de Consulta")
+
+    ciudades = ["Todas"] + sorted([c for c in df["ciudad"].dropna().unique().tolist() if str(c).strip()]) if "ciudad" in df.columns else ["Todas"]
+    ciudad_sel = st.sidebar.selectbox("Ciudad:", ciudades)
+
+    categorias = ["Todas"] + sorted([c for c in df["categoria"].dropna().unique().tolist() if str(c).strip()]) if "categoria" in df.columns else ["Todas"]
+    cat_sel = st.sidebar.selectbox("Categoría:", categorias)
+
+    estados = ["Todos"] + sorted([c for c in df["estado"].dropna().unique().tolist() if str(c).strip()]) if "estado" in df.columns else ["Todos"]
+    estado_sel = st.sidebar.selectbox("Estado de orden:", estados)
+
+    df_f = df.copy()
+    if ciudad_sel != "Todas" and "ciudad" in df_f.columns:
+        df_f = df_f[df_f["ciudad"] == ciudad_sel]
+    if cat_sel != "Todas" and "categoria" in df_f.columns:
+        df_f = df_f[df_f["categoria"] == cat_sel]
+    if estado_sel != "Todos" and "estado" in df_f.columns:
+        df_f = df_f[df_f["estado"] == estado_sel]
+
+    # KPIs
+    k1, k2, k3, k4 = st.columns(4)
+    total_ventas = float(df_f["total_venta"].sum())
+    total_unidades = int(df_f["cantidad"].sum())
+    num_ordenes = len(df_f)
+    ticket_medio = (total_ventas / num_ordenes) if num_ordenes > 0 else 0.0
+
+    k1.metric("Ingresos Totales", f"${total_ventas:,.2f}")
+    k2.metric("Unidades Vendidas", f"{total_unidades:,}")
+    k3.metric("Ticket Promedio", f"${ticket_medio:,.2f}")
+    k4.metric("Nº de Órdenes", num_ordenes)
+
+    st.markdown("---")
+
+    # Gráficos
+    c_g1, c_g2 = st.columns(2)
+    with c_g1:
+        st.subheader("Ventas por Categoría")
+        if "categoria" in df_f.columns and len(df_f) > 0:
+            ventas_cat = df_f.groupby("categoria")["total_venta"].sum()
+            st.bar_chart(ventas_cat)
+        else:
+            st.info("Sin datos para mostrar.")
+
+    with c_g2:
+        st.subheader("Ventas por Ciudad")
+        if "ciudad" in df_f.columns and len(df_f) > 0:
+            ventas_ciudad = df_f.groupby("ciudad")["total_venta"].sum()
+            st.bar_chart(ventas_ciudad)
+        else:
+            st.info("Sin datos para mostrar.")
+
+with tab_edit:
+    st.subheader("📝 Edición directa en la Base de Datos")
+    st.caption("Modifica celdas haciendo doble clic. La columna 'total_venta' se calcula sola en Excel mediante fórmula `=G*H`.")
+    
+    df_editado = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        disabled=["total_venta"]
+    )
+    
+    if st.button("💾 Guardar cambios en Google Drive", type="primary"):
+        try:
+            with st.spinner("Guardando y formateando en Google Drive..."):
+                save_data_to_drive(FILE_ID, df_editado)
+            st.success("¡Base de datos actualizada con formato profesional y fórmulas en Google Drive!")
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error al guardar: {e}")
